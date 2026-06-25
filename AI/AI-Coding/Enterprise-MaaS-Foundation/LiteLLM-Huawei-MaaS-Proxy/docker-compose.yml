@@ -1,0 +1,193 @@
+x-default: &default
+  restart: unless-stopped
+  logging:
+    driver: "json-file"
+    options:
+      max-size: "10m"
+      max-file: "3"
+
+services:
+  litellm:
+    <<: *default
+    container_name: litellm_proxy
+    image: ghcr.io/berriai/litellm:v1.83.14-stable.patch.3
+    ports:
+      - "4000:4000"
+    volumes:
+      - ./assets/config/litellm_config.yaml:/app/config.yaml:ro
+      - ./assets/config/custom_callbacks.py:/app/custom_callbacks.py:ro
+      - ./assets/config/rolling_budget_hook.py:/app/rolling_budget_hook.py:ro
+      # ── Source patches applied over the pinned image (see patches/README.md) ──
+      # Adapt the Responses-API streaming path for Huawei MaaS / Anthropic clients.
+      # Mounted over both the editable and site-packages copies of litellm.
+      - ./patches/proxy_server.py:/app/litellm/proxy/proxy_server.py:ro
+      - ./patches/utils.py:/app/litellm/proxy/utils.py:ro
+      - ./patches/proxy_server.py:/app/.venv/lib/python3.13/site-packages/litellm/proxy/proxy_server.py:ro
+      - ./patches/utils.py:/app/.venv/lib/python3.13/site-packages/litellm/proxy/utils.py:ro
+      # ── Optional: BR fintech DLP guardrail (external risk-control project) ──
+      # Enable together with the guardrails block in litellm_config.yaml.example.
+      # Provide your own br_dlp_guardrail.py + br_dlp_policy.yaml (see
+      # references/operations.md "BR DLP guardrails"); paths are examples.
+      # - ./assets/guardrails/br_dlp_guardrail.py:/app/br_dlp_guardrail.py:ro
+      # - ./assets/guardrails/br_dlp_policy.yaml:/app/br_dlp_policy.yaml:ro
+    environment:
+      DATABASE_URL: "postgresql://llmproxy:${DB_PASSWORD}@db:5432/litellm"
+      STORE_MODEL_IN_DB: "True"
+      # ── Three-tier rolling-window budget (rolling_budget_hook.py) ──
+      # Format "<n><s|m|h|d>:<usd>". Default is effectively unlimited; set real
+      # tiers in .env. Production reference: 5h:12 / 7d:30 / 30d:60.
+      BUDGET_TIER_KEY: "${BUDGET_TIER_KEY:-999d:999999}"
+      BUDGET_TIER_USER: "${BUDGET_TIER_USER:-999d:999999}"
+      BUDGET_TIER_TEAM: "${BUDGET_TIER_TEAM:-999d:999999}"
+      # Path the optional BR DLP guardrail reads its policy from (see above).
+      # BR_DLP_POLICY_PATH: "/app/br_dlp_policy.yaml"
+    env_file:
+      - .env
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import urllib.request; urllib.request.urlopen('http://localhost:4000/health/liveliness')\""]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    command:
+      - "--config=/app/config.yaml"
+
+  db:
+    <<: *default
+    image: postgres:16-alpine
+    container_name: litellm_pg_db
+    environment:
+      POSTGRES_DB: litellm
+      POSTGRES_USER: llmproxy
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -d litellm -U llmproxy"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  prometheus:
+    <<: *default
+    image: prom/prometheus:v3.3.1
+    container_name: litellm_prometheus
+    volumes:
+      - ./assets/config/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    ports:
+      - "9090:9090"
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=${PROMETHEUS_RETENTION:-15d}"
+    depends_on:
+      litellm:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget --spider -q http://localhost:9090/-/healthy || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  grafana:
+    <<: *default
+    image: grafana/grafana:11.5.2
+    container_name: litellm_grafana
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - ./assets/config/grafana/provisioning:/etc/grafana/provisioning:ro
+      - grafana_data:/var/lib/grafana
+    depends_on:
+      prometheus:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget --spider -q http://localhost:3000/api/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+  # ───────── Optional: self-hosted SearXNG search MCP ─────────
+  # Opt-in alternative to Exa. Start with: docker compose --profile search up -d
+  # Generate the settings file first (see README "Self-hosted SearXNG search MCP").
+  searxng:
+    <<: *default
+    image: searxng/searxng:latest
+    container_name: litellm_searxng
+    profiles: ["search"]
+    expose:
+      - "8080"
+    volumes:
+      - ./assets/config/searxng:/etc/searxng:rw
+    environment:
+      SEARXNG_BASE_URL: "http://localhost:8080/"
+      INSTANCE_NAME: "litellm-searxng"
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - SETGID
+      - SETUID
+
+  searxng-mcp:
+    <<: *default
+    image: python:3.12-slim
+    container_name: litellm_searxng_mcp
+    profiles: ["search"]
+    ports:
+      - "8788:8788"
+    volumes:
+      - ./assets/config/searxng_mcp_server.py:/app/server.py:ro
+    environment:
+      SEARXNG_URL: "http://searxng:8080"
+      # Required when the search profile is used. Left soft here so the core
+      # stack still parses without it; the MCP server refuses to start if empty.
+      MCP_TOKEN: ${MCP_TOKEN:-}
+      MCP_PORT: "8788"
+    command:
+      - "sh"
+      - "-c"
+      - "pip install --no-cache-dir 'fastmcp>=2,<3' httpx && python /app/server.py"
+    depends_on:
+      - searxng
+
+  # ───────── Optional: Anthropic-format adapter (Claude clients → :4000) ─────────
+  # Exposes an Anthropic Messages-style endpoint that forwards to LiteLLM's
+  # /v1/chat/completions. Start with: docker compose --profile adapter up -d
+  adapter:
+    <<: *default
+    image: node:20-slim
+    container_name: litellm_anthropic_adapter
+    profiles: ["adapter"]
+    ports:
+      - "4010:4010"
+    volumes:
+      - ./adapter/server.js:/app/server.js:ro
+    working_dir: /app
+    environment:
+      ADAPTER_HOST: "0.0.0.0"
+      ADAPTER_PORT: "4010"
+      LITELLM_CHAT_URL: "http://litellm:4000/v1/chat/completions"
+      LITELLM_ANTHROPIC_KEY: ${LITELLM_ANTHROPIC_KEY:-${LITELLM_CCR_KEY:-}}
+      ADAPTER_DEFAULT_MODEL: ${ADAPTER_DEFAULT_MODEL:-claude-opus-4-6}
+    command: ["node", "/app/server.js"]
+    depends_on:
+      litellm:
+        condition: service_healthy
+
+volumes:
+  postgres_data:
+    name: litellm_postgres_data
+  prometheus_data:
+    name: litellm_prometheus_data
+  grafana_data:
+    name: litellm_grafana_data
